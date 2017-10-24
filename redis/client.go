@@ -13,6 +13,10 @@ import (
 // which were put into the pipeline have had their responses read
 var ErrPipelineEmpty = errors.New("pipeline queue empty")
 
+var StatsReceiver StatsReceiverFunc
+
+type StatsReceiverFunc func(host, cmd string, args []interface{}, duration time.Duration, resp *Resp)
+
 // Client describes a Redis client.
 type Client struct {
 	conn         net.Conn
@@ -89,11 +93,26 @@ func (c *Client) Close() error {
 
 // Cmd calls the given Redis command.
 func (c *Client) Cmd(cmd string, args ...interface{}) *Resp {
-	err := c.writeRequest(request{cmd, args})
-	if err != nil {
-		return NewRespIOErr(err)
+	stats := StatsReceiver
+
+	var t time.Time
+	if stats != nil {
+		t = time.Now()
 	}
-	return c.readResp(true)
+
+	resp := func() *Resp {
+		err := c.writeRequest(request{cmd, args})
+		if err != nil {
+			return NewRespIOErr(err)
+		}
+		return c.readResp(true)
+	}()
+
+	if stats != nil {
+		stats(c.Addr, cmd, args, time.Since(t), resp)
+	}
+
+	return resp
 }
 
 // PipeAppend adds the given call to the pipeline queue.
