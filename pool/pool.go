@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/mediocregopher/radix.v2/redis"
+	"errors"
 )
 
 // Pool is a simple connection pool for redis Clients. It will create a small
@@ -71,7 +72,7 @@ func NewCustom(network, addr string, size int, df DialFunc) (*Pool, error) {
 				close(p.stopCh)
 				return
 			case <-tick.C:
-				p.Cmd("PING")
+				p.ping()
 			}
 		}
 	}()
@@ -87,14 +88,14 @@ func New(network, addr string, size int) (*Pool, error) {
 	return NewCustom(network, addr, size, redis.Dial)
 }
 
-// Get retrieves an available redis client. If there are none available it will
-// create a new one on the fly
+// Get retrieves an available redis client. If there are none available until
+// the pool timeout, an error is returned.
 func (p *Pool) Get() (*redis.Client, error) {
 	select {
 	case conn := <-p.pool:
 		return conn, nil
-	default:
-		return p.df(p.Network, p.Addr)
+	case <-time.After(time.Second * 5):
+		return nil, errors.New("pool exhausted")
 	}
 }
 
@@ -107,7 +108,10 @@ func (p *Pool) Put(conn *redis.Client) {
 		case p.pool <- conn:
 		default:
 			conn.Close()
+			p.replenish()
 		}
+	} else {
+		p.replenish()
 	}
 }
 
@@ -147,4 +151,27 @@ func (p *Pool) Empty() {
 // be creating new connections on the fly
 func (p *Pool) Avail() int {
 	return len(p.pool)
+}
+
+func (p *Pool) ping() {
+	select {
+	case conn := <-p.pool:
+		defer p.Put(conn)
+		conn.Cmd("PING")
+	default:
+	}
+}
+
+func (p *Pool) replenish() {
+	go func() {
+		for {
+			conn, err := p.df(p.Network, p.Addr)
+			if err == nil {
+				p.Put(conn)
+				return
+			}
+
+			time.Sleep(time.Second * 5)
+		}
+	}()
 }
