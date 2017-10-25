@@ -94,13 +94,9 @@ func (c *Client) Close() error {
 // Cmd calls the given Redis command.
 func (c *Client) Cmd(cmd string, args ...interface{}) *Resp {
 	stats := StatsReceiver
+	reqTime := time.Now()
 
-	var t time.Time
-	if stats != nil {
-		t = time.Now()
-	}
-
-	resp := func() *Resp {
+	r := func() *Resp {
 		err := c.writeRequest(request{cmd, args})
 		if err != nil {
 			return NewRespIOErr(err)
@@ -109,10 +105,10 @@ func (c *Client) Cmd(cmd string, args ...interface{}) *Resp {
 	}()
 
 	if stats != nil {
-		stats(c.Addr, cmd, args, time.Since(t), resp)
+		stats(c.Addr, cmd, args, time.Since(reqTime), r)
 	}
 
-	return resp
+	return r
 }
 
 // PipeAppend adds the given call to the pipeline queue.
@@ -134,16 +130,32 @@ func (c *Client) PipeResp() *Resp {
 		return NewResp(ErrPipelineEmpty)
 	}
 
-	nreqs := len(c.pending)
-	err := c.writeRequest(c.pending...)
-	c.pending = nil
-	if err != nil {
-		return NewRespIOErr(err)
+	defer func() { c.pending = nil }()
+
+	stats := StatsReceiver
+	reqTime := time.Now()
+
+	if err := c.writeRequest(c.pending...); err != nil {
+		r := NewRespIOErr(err)
+
+		if stats != nil {
+			elapsed := time.Since(reqTime)
+			for _, req := range c.pending {
+				stats(c.Addr, req.cmd, req.args, elapsed, r)
+			}
+		}
+
+		return r
 	}
+
 	c.completed = c.completedHead
-	for i := 0; i < nreqs; i++ {
+	for _, req := range c.pending {
 		r := c.readResp(true)
 		c.completed = append(c.completed, r)
+
+		if stats != nil {
+			stats(c.Addr, req.cmd, req.args, time.Since(reqTime), r)
+		}
 	}
 
 	// At this point c.completed should have something in it
