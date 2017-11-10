@@ -330,9 +330,15 @@ func (c *Cluster) resetInnerUsingPool(p clusterPool) error {
 		} else {
 			slotAddr = ip + ":" + strconv.Itoa(port)
 		}
+
 		for i := start; i <= end; i++ {
 			c.mapping[i] = slotAddr
 		}
+
+		if _, ok := pools[slotAddr]; ok {
+			continue
+		}
+
 		if slotPool, ok = c.pools[slotAddr]; ok {
 			pools[slotAddr] = slotPool
 		} else {
