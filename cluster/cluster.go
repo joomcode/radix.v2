@@ -149,9 +149,26 @@ func NewWithOpts(o Opts) (*Cluster, error) {
 	c.pools[o.Addr] = initialPool
 
 	go c.spin()
+
 	if err := c.Reset(); err != nil {
 		return nil, err
 	}
+
+	// Setup periodic checks so we don't get stuck with failed cluster configuration.
+	go func() {
+		for {
+			select {
+			case <-time.After(5 * time.Second):
+				c.callCh <- func(c *Cluster) {
+					// We don't want to trigger throttle with these checks.
+					c.resetInnerUnthrottled()
+				}
+			case <-c.stopCh:
+				break
+			}
+		}
+	}()
+
 	return &c, nil
 }
 
@@ -264,6 +281,10 @@ func (c *Cluster) resetInner() error {
 		c.resetThrottle = time.NewTicker(c.o.ResetThrottle)
 	}
 
+	return c.resetInnerUnthrottled()
+}
+
+func (c *Cluster) resetInnerUnthrottled() error {
 	p, addr := c.getRandomPoolInner()
 	if p == nil {
 		return fmt.Errorf("no available nodes to call CLUSTER SLOTS on")
