@@ -32,7 +32,7 @@ func TestPool(t *T) {
 
 	assert.Equal(t, size, len(pool.pool))
 
-	pool.Empty()
+	pool.Close()
 	assert.Equal(t, 0, len(pool.pool))
 }
 

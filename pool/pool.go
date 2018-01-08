@@ -18,11 +18,14 @@ type Pool struct {
 
 	stopOnce sync.Once
 	stopCh   chan bool
+}
 
-	// The network/address that the pool is connecting to. These are going to be
-	// whatever was passed into the New function. These should not be
-	// changed after the pool is initialized
-	Network, Addr string
+// AddrFunc is a function which can be passing into NewCustom and used for
+// populating pool with connection to different redis instances (e.g., slaves).
+type AddrFunc func(idx int) string
+
+func SingleAddrFunc(addr string) AddrFunc {
+	return func(_ int) string { return addr }
 }
 
 // DialFunc is a function which can be passed into NewCustom
@@ -31,11 +34,12 @@ type DialFunc func(network, addr string) (*redis.Client, error)
 // NewCustom is like New except you can specify a DialFunc which will be
 // used when creating new connections for the pool. The common use-case is to do
 // authentication for new connections.
-func NewCustom(network, addr string, size int, df DialFunc) (*Pool, error) {
+func NewCustom(network string, size int, af AddrFunc, df DialFunc) (*Pool, error) {
 	var client *redis.Client
 	var err error
 	pool := make([]*redis.Client, 0, size)
 	for i := 0; i < size; i++ {
+		addr := af(i)
 		client, err = df(network, addr)
 		if err != nil {
 			for _, client = range pool {
@@ -47,8 +51,6 @@ func NewCustom(network, addr string, size int, df DialFunc) (*Pool, error) {
 		pool = append(pool, client)
 	}
 	p := Pool{
-		Network: network,
-		Addr:    addr,
 		pool:    make(chan *redis.Client, len(pool)),
 		df:      df,
 		stopCh:  make(chan bool),
@@ -68,11 +70,10 @@ func NewCustom(network, addr string, size int, df DialFunc) (*Pool, error) {
 		defer tick.Stop()
 		for {
 			select {
-			case <-p.stopCh:
-				close(p.stopCh)
-				return
 			case <-tick.C:
 				p.ping()
+			case <-p.stopCh:
+				return
 			}
 		}
 	}()
@@ -85,7 +86,7 @@ func NewCustom(network, addr string, size int, df DialFunc) (*Pool, error) {
 // connections to have waiting to be used at any given moment. If an error is
 // encountered an empty (but still usable) pool is returned alongside that error
 func New(network, addr string, size int) (*Pool, error) {
-	return NewCustom(network, addr, size, redis.Dial)
+	return NewCustom(network, size, SingleAddrFunc(addr), redis.Dial)
 }
 
 // Get retrieves an available redis client. If there are none available until
@@ -103,15 +104,19 @@ func (p *Pool) Get() (*redis.Client, error) {
 // closed instead. If the client is already closed (due to connection failure or
 // what-have-you) it will not be put back in the pool
 func (p *Pool) Put(conn *redis.Client) {
-	if conn.LastCritical == nil {
-		select {
-		case p.pool <- conn:
-		default:
-			conn.Close()
-			p.replenish()
+	select {
+	case <-p.stopCh:
+		conn.Close()
+	default:
+		if conn.LastCritical == nil {
+			select {
+			case p.pool <- conn:
+			default:
+				conn.Close()
+			}
+		} else {
+			p.replenish(conn.Network, conn.Addr)
 		}
-	} else {
-		p.replenish()
 	}
 }
 
@@ -127,23 +132,23 @@ func (p *Pool) Cmd(cmd string, args ...interface{}) *redis.Resp {
 	return c.Cmd(cmd, args...)
 }
 
-// Empty removes and calls Close() on all the connections currently in the pool.
+// Close removes and calls Close() on all the connections currently in the pool.
 // Assuming there are no other connections waiting to be Put back this method
 // effectively closes and cleans up the pool.
-func (p *Pool) Empty() {
+func (p *Pool) Close() {
 	p.stopOnce.Do(func() {
-		p.stopCh <- true
-		<-p.stopCh
-	})
-	var conn *redis.Client
-	for {
-		select {
-		case conn = <-p.pool:
-			conn.Close()
-		default:
-			return
+		close(p.stopCh)
+
+		var conn *redis.Client
+		for {
+			select {
+			case conn = <-p.pool:
+				conn.Close()
+			default:
+				return
+			}
 		}
-	}
+	})
 }
 
 // Avail returns the number of connections currently available to be gotten from
@@ -162,16 +167,21 @@ func (p *Pool) ping() {
 	}
 }
 
-func (p *Pool) replenish() {
+func (p *Pool) replenish(network, addr string) {
 	go func() {
 		for {
-			conn, err := p.df(p.Network, p.Addr)
+			conn, err := p.df(network, addr)
 			if err == nil {
 				p.Put(conn)
 				return
 			}
 
-			time.Sleep(time.Second * 5)
+			select {
+			case <-time.After(time.Second * 5):
+				// continue
+			case <-p.stopCh:
+				return
+			}
 		}
 	}()
 }

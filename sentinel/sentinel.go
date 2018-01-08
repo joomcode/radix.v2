@@ -157,7 +157,7 @@ func NewClientCustom(
 			return nil, &ClientError{err: err, SentinelErr: true}
 		}
 		addr := l[3] + ":" + l[5]
-		pool, err := pool.NewCustom("tcp", addr, poolSize, (pool.DialFunc)(df))
+		pool, err := pool.NewCustom("tcp", poolSize, pool.SingleAddrFunc(addr), (pool.DialFunc)(df))
 		if err != nil {
 			return nil, &ClientError{err: err}
 		}
@@ -251,14 +251,14 @@ func (c *Client) spin() {
 
 		case sm := <-c.switchMasterCh:
 			if p, ok := c.masterPools[sm.name]; ok {
-				p.Empty()
-				p, _ = pool.NewCustom("tcp", sm.addr, c.poolSize, c.dialFunc)
+				p.Close()
+				p, _ = pool.NewCustom("tcp", c.poolSize, pool.SingleAddrFunc(sm.addr), c.dialFunc)
 				c.masterPools[sm.name] = p
 			}
 
 		case <-c.closeCh:
 			for name := range c.masterPools {
-				c.masterPools[name].Empty()
+				c.masterPools[name].Close()
 			}
 			c.subClient.Client.Close()
 			close(c.getCh)

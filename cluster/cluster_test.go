@@ -66,7 +66,7 @@ func TestReset(t *T) {
 	// removed, since it's not needed
 	p, err := pool.New("tcp", "127.0.0.1:6379", 10)
 	assert.Nil(t, err)
-	cluster.pools["127.0.0.1:6379"] = newClusterPool(p)
+	cluster.pools["127.0.0.1:6379"] = p
 
 	// We use resetInnerUsingPool so that we can specifically specify the pool
 	// being used, so we don't accidentally use the 6379 one (which doesn't have
