@@ -73,7 +73,7 @@ func TestReset(t *T) {
 	// CLUSTER commands)
 	respCh := make(chan bool)
 	cluster.callCh <- func(c *Cluster) {
-		err := cluster.resetInnerUsingPool(old7000Pool, addr1)
+		err := cluster.resetInnerUsingPool(old7000Pool)
 		assert.Nil(t, err)
 		respCh <- true
 	}
