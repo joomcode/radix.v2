@@ -14,10 +14,13 @@ import (
 // be closed.
 type Pool struct {
 	pool chan *redis.Client
+	spare chan string
 	df   DialFunc
 
 	stopOnce sync.Once
 	stopCh   chan bool
+
+	network string
 }
 
 // AddrFunc is a function which can be passing into NewCustom and used for
@@ -35,42 +38,31 @@ type DialFunc func(network, addr string) (*redis.Client, error)
 // used when creating new connections for the pool. The common use-case is to do
 // authentication for new connections.
 func NewCustom(network string, size int, af AddrFunc, df DialFunc) (*Pool, error) {
-	var client *redis.Client
-	var err error
-	pool := make([]*redis.Client, 0, size)
-	for i := 0; i < size; i++ {
-		addr := af(i)
-		client, err = df(network, addr)
-		if err != nil {
-			for _, client = range pool {
-				client.Close()
-			}
-			pool = pool[:0]
-			break
-		}
-		pool = append(pool, client)
-	}
 	p := Pool{
-		pool:    make(chan *redis.Client, len(pool)),
+		pool:    make(chan *redis.Client, size),
+		spare:   make(chan string, size),
 		df:      df,
 		stopCh:  make(chan bool),
-	}
-	for i := range pool {
-		p.pool <- pool[i]
+		network: network,
 	}
 
-	if size < 1 {
+	client, err := df(network, af(0))
+	if err != nil {
 		return nil, err
+	}
+
+	p.pool <- client
+
+	for i := 1; i < size; i++ {
+		p.spare <- af(i)
 	}
 
 	// set up a go-routine which will periodically ping connections in the pool.
 	// if the pool is idle every connection will be hit once every 10 seconds.
 	go func() {
-		tick := time.NewTicker(10 * time.Second / time.Duration(size))
-		defer tick.Stop()
 		for {
 			select {
-			case <-tick.C:
+			case <-time.After(10 * time.Second / time.Duration(size - len(p.spare))):
 				p.ping()
 			case <-p.stopCh:
 				return
@@ -93,10 +85,30 @@ func New(network, addr string, size int) (*Pool, error) {
 // the pool timeout, an error is returned.
 func (p *Pool) Get() (*redis.Client, error) {
 	select {
-	case conn := <-p.pool:
+	case conn := <- p.pool:
 		return conn, nil
-	case <-time.After(time.Second * 5):
-		return nil, errors.New("pool exhausted")
+
+	default:
+		select {
+		case conn := <- p.pool:
+			return conn, nil
+
+		case addr := <- p.spare:
+			var conn *redis.Client
+			var err error
+
+			defer func() {
+				if err != nil {
+					p.replenish(p.network, addr)
+				}
+			}()
+
+			conn, err = p.df(p.network, addr)
+			return conn, err
+
+		case <-time.After(time.Second * 5):
+			return nil, errors.New("pool exhausted")
+		}
 	}
 }
 
@@ -185,3 +197,4 @@ func (p *Pool) replenish(network, addr string) {
 		}
 	}()
 }
+
