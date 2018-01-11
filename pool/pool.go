@@ -60,7 +60,7 @@ func NewCustom(network string, size int, af AddrFunc, df DialFunc) (*Pool, error
 	}
 
 	if size < 1 {
-		return &p, err
+		return nil, err
 	}
 
 	// set up a go-routine which will periodically ping connections in the pool.

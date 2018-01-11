@@ -56,6 +56,7 @@ type Cluster struct {
 	o             Opts
 	mapping       mapping
 	shards        map[string]*shard
+	masterAddrs   map[string]string
 	poolThrottles map[string]<-chan time.Time
 	resetThrottle *time.Ticker
 	callCh        chan func(*Cluster)
@@ -146,6 +147,7 @@ func NewWithOpts(o Opts) (*Cluster, error) {
 		o:             o,
 		mapping:       mapping{},
 		shards:        map[string]*shard{},
+		masterAddrs:   map[string]string{},
 		poolThrottles: map[string]<-chan time.Time{},
 		callCh:        make(chan func(*Cluster)),
 		stopCh:        make(chan struct{}),
@@ -153,16 +155,16 @@ func NewWithOpts(o Opts) (*Cluster, error) {
 		ChangeCh:      make(chan struct{}),
 	}
 
-	initialShard, err := c.newShard(newShardAddrs(o.Addr), 1, true)
+	initialPool, err := c.newInitialPool()
 	if err != nil {
 		return nil, err
 	}
 
-	if err := c.resetInnerUsingPool(initialShard.Pool); err != nil {
+	if err := c.resetInnerUsingPool(initialPool); err != nil {
 		return nil, err
 	}
 
-	initialShard.Pool.Close()
+	initialPool.Close()
 
 	go c.spin()
 
@@ -182,6 +184,10 @@ func NewWithOpts(o Opts) (*Cluster, error) {
 	}()
 
 	return &c, nil
+}
+
+func (c *Cluster) newInitialPool() (*pool.Pool, error) {
+	return pool.NewCustom("tcp", 1, pool.SingleAddrFunc(c.o.Addr), pool.DialFunc(c.o.Dialer))
 }
 
 func (c *Cluster) newShard(addrs shardAddrs, size int, clearThrottle bool) (*shard, error) {
@@ -263,32 +269,49 @@ func (c *Cluster) getConn(key, addr string) (*redis.Client, error) {
 			addr = keyToAddr(key, &c.mapping)
 		}
 
-		s, ok := c.shards[addr]
-		if !ok {
-			var err error
-			if s, err = c.newShard(newShardAddrs(addr), c.o.PoolSize, false); err == nil {
-				c.shards[addr] = s
+		if addr != "" {
+			s := c.getShard(addr)
+
+			if s == nil {
+				var err error
+				if s, err = c.newShard(newShardAddrs(addr), c.o.PoolSize, false); err == nil {
+					c.shards[addr] = s
+				}
+			}
+
+			if s != nil {
+				respCh <- s.Pool
+				return
 			}
 		}
 
-		if s != nil {
-			respCh <- s.Pool
-		} else {
-			respCh <- c.getRandomPoolInner()
-		}
+		respCh <- c.getRandomPoolInner()
 	}
 
 	return (<-respCh).Get()
 }
 
+func (c *Cluster) getShard(addr string) *shard {
+	if masterAddr := c.masterAddrs[addr]; masterAddr != "" {
+		addr = masterAddr
+	}
+
+	return c.shards[addr]
+}
+
 // Put puts the connection back in its pool. To be used alongside any of the
 // Get* methods once use of the redis.Client is done
 func (c *Cluster) Put(conn *redis.Client) {
-	respCh := make(chan *pool.Pool)
+	respCh := make(chan *shard)
 	c.callCh <- func(c *Cluster) {
-		respCh <- c.shards[conn.Addr].Pool
+		respCh <- c.getShard(conn.Addr)
 	}
-	(<-respCh).Put(conn)
+
+	if shard := <-respCh; shard != nil {
+		shard.Pool.Put(conn)
+	} else {
+		conn.Close()
+	}
 }
 
 func (c *Cluster) getRandomPoolInner() *pool.Pool {
@@ -334,6 +357,13 @@ func (c *Cluster) resetInner() error {
 
 func (c *Cluster) resetInnerUnthrottled() error {
 	p := c.getRandomPoolInner()
+
+	if p == nil {
+		if p, _ = c.newInitialPool(); p != nil {
+			defer p.Close()
+		}
+	}
+
 	if p == nil {
 		return fmt.Errorf("no available nodes to call CLUSTER SLOTS on")
 	}
@@ -353,6 +383,7 @@ func (c *Cluster) resetInnerUsingPool(p *pool.Pool) error {
 	defer p.Put(client)
 
 	shards := map[string]*shard{}
+	masterAddrs := map[string]string{}
 
 	elems, err := client.Cmd("CLUSTER", "SLOTS").Array()
 	if err != nil {
@@ -387,7 +418,11 @@ func (c *Cluster) resetInnerUsingPool(p *pool.Pool) error {
 			c.mapping[i] = addrs.Master()
 		}
 
-		if _, ok := shards[addrs.Master()]; !ok {
+		for _, addr := range addrs.All() {
+			masterAddrs[addr] = addrs.Master()
+		}
+
+		if _, ok := shards[addrs.Master()]; ok {
 			continue
 		}
 
@@ -403,8 +438,8 @@ func (c *Cluster) resetInnerUsingPool(p *pool.Pool) error {
 			return err
 		}
 
-		changed = true
 		shards[addrs.Master()] = shard
+		changed = true
 	}
 
 	for addr, existing := range c.shards {
@@ -417,6 +452,7 @@ func (c *Cluster) resetInnerUsingPool(p *pool.Pool) error {
 	}
 
 	c.shards = shards
+	c.masterAddrs = masterAddrs
 
 	if changed {
 		select {
