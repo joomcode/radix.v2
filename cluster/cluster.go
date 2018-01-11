@@ -160,23 +160,22 @@ func NewWithOpts(o Opts) (*Cluster, error) {
 		return nil, err
 	}
 
-	if err := c.resetInnerUsingPool(initialPool); err != nil {
+	go c.spin()
+
+	if err := c.resetUsingPool(initialPool); err != nil {
+		close(c.stopCh)
 		return nil, err
 	}
 
 	initialPool.Close()
-
-	go c.spin()
 
 	// Setup periodic checks so we don't get stuck with failed cluster configuration.
 	go func() {
 		for {
 			select {
 			case <-time.After(5 * time.Second):
-				c.callCh <- func(c *Cluster) {
-					// We don't want to trigger throttle with these checks.
-					c.resetInnerUnthrottled()
-				}
+				// We don't want to trigger throttle with these checks.
+				c.resetUnthrottled()
 			case <-c.stopCh:
 				break
 			}
@@ -215,11 +214,7 @@ func (c *Cluster) newShard(addrs shardAddrs, size int, clearThrottle bool) (*sha
 	}
 
 	af := func(idx int) string {
-		addrIdx := idx / (size / len(modeAddrs))
-		if addrIdx > len(modeAddrs) - 1 {
-			addrIdx = len(modeAddrs) - 1
-		}
-		return modeAddrs[addrIdx]
+		return modeAddrs[idx % len(modeAddrs)]
 	}
 
 	df := func(network, addr string) (*redis.Client, error) {
@@ -331,14 +326,6 @@ func (c *Cluster) getRandomPoolInner() *pool.Pool {
 // the same time and it will only actually occur once (subsequent clients will
 // have nil returned immediately).
 func (c *Cluster) Reset() error {
-	respCh := make(chan error)
-	c.callCh <- func(c *Cluster) {
-		respCh <- c.resetInner()
-	}
-	return <-respCh
-}
-
-func (c *Cluster) resetInner() error {
 	// Throttle resetting so a bunch of routines can call Reset at once and the
 	// server won't be spammed. We don't a throttle until the second Reset is
 	// called, so the initial call inside New goes through correctly
@@ -352,11 +339,15 @@ func (c *Cluster) resetInner() error {
 		c.resetThrottle = time.NewTicker(c.o.ResetThrottle)
 	}
 
-	return c.resetInnerUnthrottled()
+	return c.resetUnthrottled()
 }
 
-func (c *Cluster) resetInnerUnthrottled() error {
-	p := c.getRandomPoolInner()
+func (c *Cluster) resetUnthrottled() error {
+	respCh := make(chan *pool.Pool)
+	c.callCh <- func(c *Cluster) {
+		respCh <- c.getRandomPoolInner()
+	}
+	p := <-respCh
 
 	if p == nil {
 		if p, _ = c.newInitialPool(); p != nil {
@@ -368,29 +359,47 @@ func (c *Cluster) resetInnerUnthrottled() error {
 		return fmt.Errorf("no available nodes to call CLUSTER SLOTS on")
 	}
 
-	return c.resetInnerUsingPool(p)
+	return c.resetUsingPool(p)
 }
 
-func (c *Cluster) resetInnerUsingPool(p *pool.Pool) error {
+func (c *Cluster) resetUsingPool(p *pool.Pool) error {
 	// If we move the throttle check to be in here we'll have to fix the test in
 	// TestReset, since it depends on being able to call Reset right after
 	// initializing the cluster
 
-	client, err := p.Get()
+	elems, clientAddr, err := c.getClusterSlotsInfo(p)
 	if err != nil {
 		return err
 	}
-	defer p.Put(client)
 
-	shards := map[string]*shard{}
-	masterAddrs := map[string]string{}
+	respCh := make(chan error)
+	c.callCh <- func(c *Cluster) {
+		respCh <- c.updateClusterConfigInner(elems, clientAddr)
+	}
+	return <-respCh
+}
+
+func (c *Cluster) getClusterSlotsInfo(p *pool.Pool) ([]*redis.Resp, string, error) {
+	client, err := p.Get()
+	if err != nil {
+		return nil, "", err
+	}
+
+	defer p.Put(client)
 
 	elems, err := client.Cmd("CLUSTER", "SLOTS").Array()
 	if err != nil {
-		return err
+		return nil, "", err
 	} else if len(elems) == 0 {
-		return errors.New("empty CLUSTER SLOTS response")
+		return nil, "", errors.New("empty CLUSTER SLOTS response")
 	}
+
+	return elems, client.Addr, nil
+}
+
+func (c *Cluster) updateClusterConfigInner(elems []*redis.Resp, clientAddr string) error {
+	shards := map[string]*shard{}
+	masterAddrs := map[string]string{}
 
 	var changed bool
 	for _, slotGroup := range elems {
@@ -409,7 +418,7 @@ func (c *Cluster) resetInnerUsingPool(p *pool.Pool) error {
 			return err
 		}
 
-		addrs, err := c.parseClusterSlotsRespAddrs(slotElems[2:], client)
+		addrs, err := c.parseClusterSlotsRespAddrs(slotElems[2:], clientAddr)
 		if err != nil {
 			return err
 		}
@@ -464,14 +473,14 @@ func (c *Cluster) resetInnerUsingPool(p *pool.Pool) error {
 	return nil
 }
 
-func (c *Cluster) parseClusterSlotsRespAddrs(resps []*redis.Resp, client *redis.Client) (shardAddrs, error) {
+func (c *Cluster) parseClusterSlotsRespAddrs(resps []*redis.Resp, clientAddr string) (shardAddrs, error) {
 	if c.o.Mode == ModeMaster {
 		resps = resps[:1]
 	}
 
 	var addrs []string
 	for _, resp := range resps {
-		addr, err := c.parseClusterSlotsRespAddr(resp, client)
+		addr, err := c.parseClusterSlotsRespAddr(resp, clientAddr)
 		if err != nil {
 			return nil, err
 		}
@@ -482,7 +491,7 @@ func (c *Cluster) parseClusterSlotsRespAddrs(resps []*redis.Resp, client *redis.
 	return newShardAddrs(addrs...), nil
 }
 
-func (c *Cluster) parseClusterSlotsRespAddr(resp *redis.Resp, client *redis.Client) (string, error) {
+func (c *Cluster) parseClusterSlotsRespAddr(resp *redis.Resp, clientAddr string) (string, error) {
 	respElems, err := resp.Array()
 	if err != nil {
 		return "", err
@@ -502,7 +511,7 @@ func (c *Cluster) parseClusterSlotsRespAddr(resp *redis.Resp, client *redis.Clie
 	// connected to. I guess the node doesn't know its own ip? I guess that
 	// makes sense
 	if ip == "" {
-		return client.Addr, nil
+		return clientAddr, nil
 	} else {
 		return ip + ":" + strconv.Itoa(port), nil
 	}
