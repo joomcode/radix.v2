@@ -224,7 +224,12 @@ func (c *Cluster) newShard(addrs shardAddrs, size int, clearThrottle bool) (*sha
 		}
 
 		if addr != addrs.Master() {
-			c.Cmd("READONLY")
+			if resp := c.Cmd("READONLY"); resp.Err != nil {
+				if c.LastCritical == nil {
+					c.Close()
+				}
+				return nil, err
+			}
 		}
 
 		return c, nil
