@@ -7,6 +7,7 @@ import (
 type shard struct {
 	Pool  *pool.Pool
 	Addrs shardAddrs
+	NeedsHealthCheck bool
 }
 
 type shardAddrs []string

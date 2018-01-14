@@ -432,19 +432,29 @@ func (c *Cluster) updateClusterConfigInner(elems []*redis.Resp, clientAddr strin
 			c.mapping[i] = addrs.Master()
 		}
 
-		for _, addr := range addrs.All() {
-			masterAddrs[addr] = addrs.Master()
-		}
-
 		if _, ok := shards[addrs.Master()]; ok {
 			continue
 		}
 
-		if existing, ok := c.shards[addrs.Master()]; ok {
-			if existing.Addrs.Equals(addrs) {
-				shards[addrs.Master()] = existing
-				continue
-			}
+		for _, addr := range addrs.All() {
+			masterAddrs[addr] = addrs.Master()
+		}
+
+		existingShard := c.shards[addrs.Master()]
+
+		if existingShard != nil && existingShard.Addrs.Equals(addrs) && !existingShard.NeedsHealthCheck {
+			shards[addrs.Master()] = existingShard
+			continue
+		}
+
+		addrs = c.checkSlavesHealth(addrs)
+
+		// One more time because addrs may have changed after health check.
+		if existingShard != nil && existingShard.Addrs.Equals(addrs) {
+			existingShard.NeedsHealthCheck = false
+
+			shards[addrs.Master()] = existingShard
+			continue
 		}
 
 		shard, err := c.newShard(addrs, c.o.PoolSize, true)
@@ -520,6 +530,41 @@ func (c *Cluster) parseClusterSlotsRespAddr(resp *redis.Resp, clientAddr string)
 	} else {
 		return ip + ":" + strconv.Itoa(port), nil
 	}
+}
+
+func (c *Cluster) checkSlavesHealth(addrs shardAddrs) shardAddrs {
+	var checked []string
+	for _, addr := range addrs.Slaves() {
+		if c.checkAddrHealth(addr) {
+			checked = append(checked, addr)
+		}
+	}
+
+	return newShardAddrs(append([]string{addrs.Master()}, checked...)...)
+}
+
+func (c *Cluster) checkAddrHealth(addr string) bool {
+	client, err := c.o.Dialer("tcp", addr)
+	if err != nil {
+		return false
+	}
+
+	defer func() {
+		if client.LastCritical == nil {
+			client.Close()
+		}
+	}()
+
+	info, err := client.Cmd("INFO").Str()
+	if err != nil {
+		return false
+	}
+
+	if strings.Contains(info, "loading:1") {
+		return false
+	}
+
+	return true
 }
 
 // Logic for doing a command:
@@ -636,8 +681,10 @@ func (c *Cluster) clientCmd(
 		return r
 	}
 
-	// Here we deal with application errors that are either MOVED or ASK
+	// Here we deal with some specific application errors
 	msg := err.Error()
+
+	// Deal with MOVED or ASK
 	moved := strings.HasPrefix(msg, "MOVED ")
 	ask = strings.HasPrefix(msg, "ASK ")
 	if moved || ask {
@@ -671,6 +718,17 @@ func (c *Cluster) clientCmd(
 			return errorResp(getErr)
 		}
 		return c.clientCmd(client, cmd, args, ask, tried, haveReset)
+	}
+
+	// Deal with LOADING
+	if strings.HasPrefix(msg, "LOADING") {
+		c.callCh <- func(c *Cluster) {
+			if shard := c.getShard(client.Addr); shard != nil {
+				shard.NeedsHealthCheck = true
+			}
+		}
+
+		// TODO? This is such a mess though.
 	}
 
 	// It's a normal application error (like WRONG KEY TYPE or whatever), return
