@@ -447,7 +447,7 @@ func (c *Cluster) updateClusterConfigInner(elems []*redis.Resp, clientAddr strin
 			continue
 		}
 
-		addrs = c.checkSlavesHealth(addrs)
+		addrs = c.checkAddrsHealth(addrs)
 
 		// One more time because addrs may have changed after health check.
 		if existingShard != nil && existingShard.Addrs.Equals(addrs) {
@@ -532,10 +532,10 @@ func (c *Cluster) parseClusterSlotsRespAddr(resp *redis.Resp, clientAddr string)
 	}
 }
 
-func (c *Cluster) checkSlavesHealth(addrs shardAddrs) shardAddrs {
+func (c *Cluster) checkAddrsHealth(addrs shardAddrs) shardAddrs {
 	var checked []string
 	for _, addr := range addrs.Slaves() {
-		if c.checkAddrHealth(addr) {
+		if c.checkSlaveAddrHealth(addr) {
 			checked = append(checked, addr)
 		}
 	}
@@ -543,7 +543,7 @@ func (c *Cluster) checkSlavesHealth(addrs shardAddrs) shardAddrs {
 	return newShardAddrs(append([]string{addrs.Master()}, checked...)...)
 }
 
-func (c *Cluster) checkAddrHealth(addr string) bool {
+func (c *Cluster) checkSlaveAddrHealth(addr string) bool {
 	client, err := c.o.Dialer("tcp", addr)
 	if err != nil {
 		return false
@@ -560,7 +560,7 @@ func (c *Cluster) checkAddrHealth(addr string) bool {
 		return false
 	}
 
-	if strings.Contains(info, "loading:1") {
+	if strings.Contains(info, "master_link_status:down") || strings.Contains(info, "loading:1") {
 		return false
 	}
 
